@@ -7,20 +7,9 @@
 
 #include "xmalloc.h"
 
-/*
-  typedef struct hm_stats {
-  long pages_mapped;
-  long pages_unmapped;
-  long chunks_allocated;
-  long chunks_freed;
-  long free_length;
-  } hm_stats;
-*/
-
 const size_t PAGE_SIZE = 4096;
-static hm_stats stats; // This initializes the stats to 0.
 static free_list_cell* free_list;
-// static pthread_mutex_t mut = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
 void
 check_rv(int rv)
@@ -45,25 +34,6 @@ free_list_length()
     }
 
     return count;
-}
-
-hm_stats*
-hgetstats()
-{
-    stats.free_length = free_list_length();
-    return &stats;
-}
-
-void
-hprintstats()
-{
-    stats.free_length = free_list_length();
-    fprintf(stderr, "\n== husky malloc stats ==\n");
-    fprintf(stderr, "Mapped:   %ld\n", stats.pages_mapped);
-    fprintf(stderr, "Unmapped: %ld\n", stats.pages_unmapped);
-    fprintf(stderr, "Allocs:   %ld\n", stats.chunks_allocated);
-    fprintf(stderr, "Frees:    %ld\n", stats.chunks_freed);
-    fprintf(stderr, "Freelen:  %ld\n", stats.free_length);
 }
 
 static
@@ -173,6 +143,8 @@ free_list_add(void* addr, size_t size)
             curr->next = new_cell;
 
             coalesce(curr, new_cell);
+
+            break;
         }
 
         prev = curr;
@@ -196,10 +168,7 @@ available_addr(size_t size)
 void*
 xmalloc(size_t size)
 {
-    // int rv = pthread_mutex_lock(&mut);
-    // check_rv(rv);
-
-    stats.chunks_allocated += 1;
+    pthread_mutex_lock(&lock);
     size += sizeof(size_t);
     void* addr;
     
@@ -222,7 +191,6 @@ xmalloc(size_t size)
             addr = mmap(0, PAGE_SIZE, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
             check_rv(*((int*)addr));
             
-            stats.pages_mapped += 1;
             block_size = PAGE_SIZE;
         }
 
@@ -236,7 +204,7 @@ xmalloc(size_t size)
             free_list_add(free_addr, free_size); 
         }  
 
-        size_header* head = addr;
+        block_header* head = addr;
         head->size = size;
     }
     // requests with B >= 1 page
@@ -248,15 +216,13 @@ xmalloc(size_t size)
         // allocate that many pages
         addr = mmap(0, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
         check_rv(*((int*)addr));
-        stats.pages_mapped += num_pages;
 
         // fill in the size of the block as (# of pages * 4096)
-        size_header* head = addr;
+        block_header* head = addr;
         head->size = size;
     }
 
-    // rv = pthread_mutex_unlock(&mut);
-    // check_rv(rv);
+    pthread_mutex_unlock(&lock);
 
     // return pointer to the block after size field
     return (void*)((size_t*)addr + 1);
@@ -265,15 +231,11 @@ xmalloc(size_t size)
 void
 xfree(void* item)
 {
-    // int rv = pthread_mutex_lock(&mut);
-    // check_rv(rv);
-
-    stats.chunks_freed += 1;
-    
+    pthread_mutex_lock(&lock);
     // item_addr is the address of the item including its size
-    void* item_addr = (void*)((size_t*)item - 1);
+    void* item_addr = (void*)(((size_t*)item) - 1);
     // size is the size of the item
-    size_t size = ((size_header*)item_addr)->size;
+    size_t size = ((block_header*)item_addr)->size;
 
     // if block is < 1 page then stick it on free_list
     if (size < PAGE_SIZE) {
@@ -283,18 +245,13 @@ xfree(void* item)
     // if block is >= 1 page then munmap it
     else {
         munmap(item_addr, size);
-        stats.pages_unmapped += div_up(size, PAGE_SIZE);
     }
-
-    // rv = pthread_mutex_unlock(&mut);
-    // check_rv(rv);
+    pthread_mutex_unlock(&lock);
 }
 
 void*
-xrealloc(void* ptr, size_t size)
+xrealloc(void* prev, size_t bytes)
 {
-//    free(ptr);
-//    return malloc(size);
-
-    return ptr + size;
+    xfree(prev);
+    return xmalloc(bytes);
 }
