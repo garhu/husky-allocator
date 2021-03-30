@@ -5,20 +5,25 @@
 #include <pthread.h>
 #include <stdbool.h>
 
-typedef struct free_list_cell {
-    size_t size;
+typedef struct free_list_node {
     int arena_id;
-    struct free_list_cell* next;
-} free_list_cell;
+    struct free_list_node* next;
+} free_list_node;
 
 typedef struct block_header {
     size_t size;
     int arena_id;
 } block_header;
 
+typedef struct bucket {
+    size_t size;
+    int num_cells;
+    free_list_node* free_list;
+} bucket;
+
 typedef struct arena {
     pthread_mutex_t lock;
-    struct free_list_cell* free_list;
+    bucket* buckets[8];
     bool used;
 } arena;
 

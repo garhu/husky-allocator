@@ -5,14 +5,12 @@
 #include <stdint.h>
 #include <pthread.h>
 
+#include "hwx_malloc.h"
 #include "xmalloc.h"
 
-#define ARENAS 5
-
 const size_t PAGE_SIZE = 4096;
+static free_list_cell* free_list;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
-static arena arenas[ARENAS];
-__thread int arena_id = -1;
 
 void
 check_rv(int rv)
@@ -29,7 +27,7 @@ long
 free_list_length()
 {
     int count = 0;
-    free_list_cell* temp = arenas[arena_id].free_list;
+    free_list_cell* temp = free_list;
     
     while (temp) {
         count++;
@@ -58,18 +56,18 @@ div_up(size_t xx, size_t yy)
 void
 free_list_remove(void* addr)
 {
-    free_list_cell* curr = arenas[arena_id].free_list;
+    free_list_cell* curr = free_list;
     free_list_cell* prev = 0;
 
     while (curr) {
         if ((uintptr_t)curr == (uintptr_t)addr) {
             // if curr is the only cell in free_list
             if (!prev && !curr->next) {
-                arenas[arena_id].free_list = 0;
+                free_list = 0;
             } 
             // if curr is the first cell in free_list
             else if (!prev) {
-                arenas[arena_id].free_list = curr->next;
+                free_list = curr->next;
             }
             // if curr is the last cell in free_list
             else if (!curr->next) {
@@ -97,19 +95,15 @@ coalesce(free_list_cell* arg1, free_list_cell* arg2)
 }
 
 void
-free_list_add(void* addr, size_t size, int item_arena)
+free_list_add(void* addr, size_t size)
 {
-    pthread_mutex_lock(&arenas[item_arena].lock);
-    
-    free_list_cell* curr = arenas[item_arena].free_list;
+    free_list_cell* curr = free_list;
 
     // if free_list is empty, set free_list to be a new free_list_cell*
     if (!curr) {
-        arenas[item_arena].free_list = (free_list_cell*)addr;
-        arenas[item_arena].free_list->size = size;
-        arenas[item_arena].free_list->arena_id = arena_id; 
-        arenas[item_arena].free_list->next = 0;
-        pthread_mutex_unlock(&arenas[item_arena].lock);
+        free_list = (free_list_cell*)addr;
+        free_list->size = size; 
+        free_list->next = 0;
         return;
     }
 
@@ -123,7 +117,6 @@ free_list_add(void* addr, size_t size, int item_arena)
             if (prev) {
                free_list_cell* new_cell = (free_list_cell*)addr;
                new_cell->size = size;
-               new_cell->arena_id = arena_id;
                new_cell->next = curr;
                prev->next = new_cell;
 
@@ -132,12 +125,11 @@ free_list_add(void* addr, size_t size, int item_arena)
             }
             // if curr is the first element
             else {
-                arenas[item_arena].free_list = (free_list_cell*)addr;
-                arenas[item_arena].free_list->size = size;
-                arenas[item_arena].free_list->arena_id = arena_id;
-                arenas[item_arena].free_list->next = curr;
+                free_list = (free_list_cell*)addr;
+                free_list->size = size;
+                free_list->next = curr;
 
-                coalesce(arenas[item_arena].free_list, curr);
+                coalesce(free_list, curr);
             }
         
             break;
@@ -148,7 +140,6 @@ free_list_add(void* addr, size_t size, int item_arena)
         if (!curr->next) {
             free_list_cell* new_cell = (free_list_cell*)addr;
             new_cell->size = size;
-            new_cell->arena_id = arena_id;
             new_cell->next = 0;
             curr->next = new_cell;
 
@@ -160,14 +151,12 @@ free_list_add(void* addr, size_t size, int item_arena)
         prev = curr;
         curr = curr->next;
     }
-
-    pthread_mutex_unlock(&arenas[item_arena].lock);
 }
 
 void*
 available_addr(size_t size)
 {
-    free_list_cell* curr = arenas[arena_id].free_list;
+    free_list_cell* curr = free_list;
     while (curr) {
         if (curr->size >= size) {
             return (void*)curr;
@@ -177,30 +166,11 @@ available_addr(size_t size)
     return 0;
 }
 
-void
-init_arena()
-{
-    for(int ii = 0; ii < ARENAS; ++ii) {
-        if (!arenas[ii].used) {
-            arena_id = ii;
-            pthread_mutex_init(&arenas[ii].lock, 0);
-            arenas[ii].free_list = 0;
-            arenas[ii].used = 1;
-            break;
-        }
-    }
-}
-
 void*
 xmalloc(size_t size)
 {
-    if (arena_id == -1) {
-        pthread_mutex_lock(&lock);
-        init_arena();
-        pthread_mutex_unlock(&lock);
-    }
-    
-    size += sizeof(block_header);
+    pthread_mutex_lock(&lock);
+    size += sizeof(size_t);
     void* addr;
     
     // requests with B < 1 page
@@ -230,14 +200,13 @@ xmalloc(size_t size)
         if (block_size - size >= sizeof(free_list_cell)) {
             // free_addr is the address of the free_list_cell
             void* free_addr = (void*)(((uintptr_t)addr) + size);
-            // free_size is the size of the free_list_cell
+            // free_size is the size ofthe free_list_cell
             size_t free_size = block_size - size; 
-            free_list_add(free_addr, free_size, arena_id); 
+            free_list_add(free_addr, free_size); 
         }  
 
         block_header* head = addr;
         head->size = size;
-        head->arena_id = arena_id;
     }
     // requests with B >= 1 page
     else {
@@ -252,48 +221,43 @@ xmalloc(size_t size)
         // fill in the size of the block as (# of pages * 4096)
         block_header* head = addr;
         head->size = size;
-        head->arena_id = arena_id;
     }
 
-    // pthread_mutex_unlock(&lock);
+    pthread_mutex_unlock(&lock);
 
     // return pointer to the block after size field
-    return (void*)((int*)addr + 3);
+    return (void*)((size_t*)addr + 1);
 }
 
 void
 xfree(void* item)
 {
-//    pthread_mutex_lock(&lock);
+    pthread_mutex_lock(&lock);
     
     // item_addr is the address of the item including its size
-    pthread_mutex_unlock(&lock);
-    // and arena_id
-    void* item_addr = (void*)((int*)item - 3);
+    void* item_addr = (void*)((size_t*)item - 1);
     // size is the size of the item
     size_t size = ((block_header*)item_addr)->size;
-
-    int item_id = ((block_header*)item_addr)->arena_id;
 
     // if block is < 1 page then stick it on free_list
     if (size < PAGE_SIZE) {
         // add to the free list
-        free_list_add(item_addr, size, item_id);
+        free_list_add(item_addr, size);
     }
     // if block is >= 1 page then munmap it
     else {
         munmap(item_addr, size);
     }
     
-//    pthread_mutex_unlock(&lock);
+    pthread_mutex_unlock(&lock);
 }
 
 void*
 xrealloc(void* prev, size_t bytes)
 {
     pthread_mutex_lock(&lock);
-    xfree(prev);    
-   
+    
+
     pthread_mutex_unlock(&lock);
     return xmalloc(bytes);
 }
